@@ -10,7 +10,6 @@ const app = express();
 const errHandler = require("./middlewares/error");
 
 //import routes
-const scrapeRouter = require("./routes/scrape-route");
 const dataSheetsRouter = require("./routes/dataSheets-route");
 
 //set cors origin to all
@@ -25,7 +24,6 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(morgan("dev"));
 
-app.use("/scrape", scrapeRouter);
 app.use("/data-sheets", dataSheetsRouter);
 
 app.use(errHandler);

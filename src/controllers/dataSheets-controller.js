@@ -46,6 +46,7 @@ const getOAuth2Clients = async () => {
     return {
       slides: google.slides({ version: "v1", auth: oauth2Client }),
       drive: google.drive({ version: "v3", auth: oauth2Client }),
+      sheets: google.sheets({ version: "v4", auth: oauth2Client }), // ADD THIS LINE
     };
   } catch (error) {
     console.error("OAuth2 client creation failed:", error);
@@ -53,9 +54,8 @@ const getOAuth2Clients = async () => {
   }
 };
 
-const SHEET_NAME = "All Daily";
 const SHEET_ID = "1vSUFAzkbusSpMgiAeDxUKXh68Jkirh1IbeRlqruYs98";
-const SHEET_RANGE = "D:R";
+
 const DEFAULT_SLIDES_FOLDER_ID = "1RDoydur_2jeMg9NcxOcXsV1zHySxyHGm";
 
 // Helper function to convert buffer to readable stream
@@ -109,10 +109,107 @@ const calculateSlideDimensions = (imageWidth, imageHeight) => {
   };
 };
 
+module.exports.checkFileType = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    console.log("=== FILE TYPE DIAGNOSTIC ===");
+    console.log("File ID:", id);
+
+    try {
+      const fileInfo = await drive.files.get({
+        fileId: id,
+        fields:
+          "id,name,mimeType,kind,createdTime,modifiedTime,webViewLink,parents",
+      });
+
+      const file = fileInfo.data;
+
+      console.log("✅ File found!");
+      console.log("📄 Name:", file.name);
+      console.log("📋 MIME Type:", file.mimeType);
+      console.log("🔗 Web View Link:", file.webViewLink);
+      console.log("⏰ Created:", file.createdTime);
+      console.log("📝 Modified:", file.modifiedTime);
+      console.log("📁 Parents:", file.parents);
+
+      // Check what type of Google file this is
+      const fileTypes = {
+        "application/vnd.google-apps.spreadsheet": "Google Sheets",
+        "application/vnd.google-apps.document": "Google Docs",
+        "application/vnd.google-apps.presentation": "Google Slides",
+        "application/vnd.google-apps.form": "Google Forms",
+        "application/vnd.google-apps.folder": "Google Drive Folder",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+          "Excel File (.xlsx)",
+        "application/vnd.ms-excel": "Excel File (.xls)",
+        "text/csv": "CSV File",
+      };
+
+      const fileType = fileTypes[file.mimeType] || `Unknown (${file.mimeType})`;
+      const isGoogleSheets =
+        file.mimeType === "application/vnd.google-apps.spreadsheet";
+
+      console.log("📊 File Type:", fileType);
+      console.log("✅ Is Google Sheets:", isGoogleSheets);
+
+      // Generate the correct URL based on file type
+      let correctUrl = file.webViewLink;
+      if (file.mimeType === "application/vnd.google-apps.spreadsheet") {
+        correctUrl = `https://docs.google.com/spreadsheets/d/${id}/edit`;
+      } else if (file.mimeType === "application/vnd.google-apps.document") {
+        correctUrl = `https://docs.google.com/document/d/${id}/edit`;
+      } else if (file.mimeType === "application/vnd.google-apps.presentation") {
+        correctUrl = `https://docs.google.com/presentation/d/${id}/edit`;
+      }
+
+      res.status(200).json({
+        message: "File type diagnostic complete",
+        fileInfo: {
+          id: file.id,
+          name: file.name,
+          mimeType: file.mimeType,
+          fileType: fileType,
+          isGoogleSheets: isGoogleSheets,
+          webViewLink: correctUrl,
+          createdTime: file.createdTime,
+          modifiedTime: file.modifiedTime,
+        },
+        diagnosis: isGoogleSheets
+          ? "✅ This IS a Google Sheets file - the Sheets API should work"
+          : `❌ This is NOT a Google Sheets file (it's ${fileType}). You cannot use the Sheets API on this file.`,
+        recommendation: isGoogleSheets
+          ? "The file is correct - there might be a permissions or API issue"
+          : "You need to either convert this file to Google Sheets format or use a different approach to read it",
+        correctUrl: correctUrl,
+      });
+    } catch (driveError) {
+      console.log("❌ Drive API error:", driveError.message);
+      console.log("Error code:", driveError.code);
+
+      let errorMessage = "Cannot access file via Drive API";
+      if (driveError.code === 404) {
+        errorMessage = "File not found - please check the file ID";
+      } else if (driveError.code === 403) {
+        errorMessage = "Access denied - check your service account permissions";
+      }
+
+      res.status(driveError.code || 500).json({
+        message: errorMessage,
+        error: driveError.message,
+        fileId: id,
+        suggestion:
+          "Make sure the file ID is correct and your service account has access to it",
+      });
+    }
+  } catch (error) {
+    console.error("❌ Unexpected error:", error);
+    next(error);
+  }
+};
+
 module.exports.getAllDataByID = async (req, res, next) => {
   try {
     const { id } = req.params;
-    console.log("Fetching All Data by ID:", id);
     const SHEET_NAME = "all";
     const SHEET_RANGE = "A:Z";
     const response = await sheets.spreadsheets.values.get({
@@ -124,11 +221,11 @@ module.exports.getAllDataByID = async (req, res, next) => {
       return null;
     }
     res.status(200).json({
-      message: "All data fetched successfully",
+      message: "all data fetched successfully",
       data: rows,
     });
   } catch (error) {
-    console.log(error);
+    console.error("❌ Unexpected error:", error);
     next(error);
   }
 };
@@ -1093,5 +1190,402 @@ module.exports.createMultiSlidePresentation = async (req, res, next) => {
   } catch (error) {
     console.error("Error creating multi-slide presentation:", error);
     next(createError(500, `Failed to create presentation: ${error.message}`));
+  }
+};
+
+// Export data to existing sheet - Modified to use OAuth2
+module.exports.exportDataToExistingSheet = async (req, res, next) => {
+  try {
+    const {
+      spreadsheetId,
+      data,
+      sheetName = "Sheet1",
+      startCell = "A1",
+      clearExisting = false,
+    } = req.body;
+
+    if (!spreadsheetId) {
+      return res.status(400).json({
+        error: "Spreadsheet ID is required",
+      });
+    }
+
+    if (!data || !Array.isArray(data) || data.length === 0) {
+      return res.status(400).json({
+        error: "Data array is required and must not be empty",
+      });
+    }
+
+    console.log(
+      `Exporting ${data.length} rows to existing sheet: ${spreadsheetId} using OAuth2`
+    );
+
+    // Use OAuth2 clients
+    const { sheets: oauthSheets } = await getOAuth2Clients();
+
+    // Clear existing data if requested
+    if (clearExisting) {
+      await oauthSheets.spreadsheets.values.clear({
+        spreadsheetId: spreadsheetId,
+        range: `${sheetName}!A:ZZ`,
+      });
+      console.log("Existing data cleared");
+    }
+
+    // Prepare data for insertion
+    const values = data.map((row) => {
+      if (Array.isArray(row)) {
+        return row;
+      } else if (typeof row === "object") {
+        return Object.values(row);
+      } else {
+        return [row];
+      }
+    });
+
+    // Insert data in batches for large datasets
+    const BATCH_SIZE = 1000;
+    const totalBatches = Math.ceil(values.length / BATCH_SIZE);
+
+    for (let i = 0; i < totalBatches; i++) {
+      const startRow = i * BATCH_SIZE;
+      const endRow = Math.min(startRow + BATCH_SIZE, values.length);
+      const batchValues = values.slice(startRow, endRow);
+
+      // Calculate the actual start cell for this batch
+      const batchStartCell =
+        startCell === "A1" ? `A${startRow + 1}` : startCell;
+
+      console.log(
+        `Inserting batch ${i + 1}/${totalBatches}: rows ${
+          startRow + 1
+        } to ${endRow}`
+      );
+
+      await oauthSheets.spreadsheets.values.update({
+        spreadsheetId: spreadsheetId,
+        range: `${sheetName}!${batchStartCell}`,
+        valueInputOption: "RAW",
+        requestBody: {
+          values: batchValues,
+        },
+      });
+
+      // Small delay between batches to avoid rate limits
+      if (i < totalBatches - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+
+    const spreadsheetUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+
+    res.status(200).json({
+      message: "Data exported to existing sheet successfully",
+      spreadsheetId: spreadsheetId,
+      spreadsheetUrl: spreadsheetUrl,
+      rowsInserted: values.length,
+      columnsInserted: values[0]?.length || 0,
+      authMethod: "OAuth2",
+      batchesProcessed: totalBatches,
+    });
+  } catch (error) {
+    console.error("Error exporting data to existing sheet:", error);
+
+    let errorMessage = `Failed to export data: ${error.message}`;
+    if (error.code === 403) {
+      errorMessage =
+        "Permission denied. Please check your OAuth2 credentials and sheet permissions.";
+    } else if (error.code === 401) {
+      errorMessage = "Authentication failed. Please refresh your OAuth2 token.";
+    } else if (error.code === 404) {
+      errorMessage = "Spreadsheet not found. Please check the spreadsheet ID.";
+    }
+
+    next(createError(500, errorMessage));
+  }
+};
+
+// Create sheet with table data - Modified to use OAuth2
+module.exports.createSheetWithTableData = async (req, res, next) => {
+  try {
+    const {
+      title = "Table Export",
+      tableData,
+      headers,
+      sheetName = "Data",
+      folderID = null,
+    } = req.body;
+
+    if (!tableData || !Array.isArray(tableData) || tableData.length === 0) {
+      return res.status(400).json({
+        error: "Table data is required and must not be empty",
+      });
+    }
+
+    console.log(
+      `Creating table sheet: ${title} with ${tableData.length} data rows using OAuth2`
+    );
+
+    // Use OAuth2 clients
+    const { sheets: oauthSheets, drive: oauthDrive } = await getOAuth2Clients();
+
+    // Prepare values array first to know the dimensions
+    const values = [];
+
+    // Add headers if provided, otherwise extract from first object
+    if (headers && Array.isArray(headers)) {
+      values.push(headers);
+    } else if (tableData[0] && typeof tableData[0] === "object") {
+      values.push(Object.keys(tableData[0]));
+    }
+
+    // Add data rows
+    tableData.forEach((row) => {
+      if (typeof row === "object" && !Array.isArray(row)) {
+        // Convert object to array maintaining header order
+        if (headers) {
+          values.push(headers.map((header) => row[header] || ""));
+        } else {
+          values.push(Object.values(row));
+        }
+      } else if (Array.isArray(row)) {
+        values.push(row);
+      } else {
+        values.push([row]);
+      }
+    });
+
+    const totalRows = values.length;
+    const totalColumns = values[0]?.length || 1;
+
+    console.log(`Total rows needed: ${totalRows}, columns: ${totalColumns}`);
+
+    // Calculate required sheet size with buffer
+    const requiredRows = Math.max(totalRows + 100, 1000); // Add buffer rows
+    const requiredColumns = Math.max(totalColumns + 5, 26); // Add buffer columns
+
+    // Create new spreadsheet with proper dimensions
+    const spreadsheet = await oauthSheets.spreadsheets.create({
+      requestBody: {
+        properties: {
+          title: title,
+        },
+        sheets: [
+          {
+            properties: {
+              title: sheetName,
+              gridProperties: {
+                rowCount: requiredRows,
+                columnCount: requiredColumns,
+              },
+            },
+          },
+        ],
+      },
+    });
+
+    const spreadsheetId = spreadsheet.data.spreadsheetId;
+    console.log(`New spreadsheet created with ID: ${spreadsheetId}`);
+    console.log(
+      `Sheet dimensions: ${requiredRows} rows x ${requiredColumns} columns`
+    );
+
+    // Move to folder if specified
+    if (folderID) {
+      try {
+        const file = await oauthDrive.files.get({
+          fileId: spreadsheetId,
+          fields: "parents",
+        });
+
+        const previousParents = file.data.parents
+          ? file.data.parents.join(",")
+          : "";
+
+        await oauthDrive.files.update({
+          fileId: spreadsheetId,
+          addParents: folderID,
+          removeParents: previousParents,
+          fields: "id, parents",
+        });
+
+        console.log("Spreadsheet moved to folder successfully");
+      } catch (folderError) {
+        console.error("Failed to move to folder:", folderError);
+      }
+    }
+
+    // Insert data in batches with proper error handling
+    const BATCH_SIZE = 1000;
+    const totalBatches = Math.ceil(values.length / BATCH_SIZE);
+
+    for (let i = 0; i < totalBatches; i++) {
+      const startRow = i * BATCH_SIZE;
+      const endRow = Math.min(startRow + BATCH_SIZE, values.length);
+      const batchValues = values.slice(startRow, endRow);
+
+      // Use A1 notation properly - start from row 1 for first batch
+      const batchStartCell = `A${startRow + 1}`;
+
+      console.log(
+        `Inserting batch ${i + 1}/${totalBatches}: rows ${
+          startRow + 1
+        } to ${endRow} (${batchValues.length} rows)`
+      );
+
+      try {
+        await oauthSheets.spreadsheets.values.update({
+          spreadsheetId: spreadsheetId,
+          range: `${sheetName}!${batchStartCell}`,
+          valueInputOption: "RAW",
+          requestBody: {
+            values: batchValues,
+          },
+        });
+
+        console.log(`✅ Batch ${i + 1} inserted successfully`);
+
+        // Small delay between batches to avoid rate limits
+        if (i < totalBatches - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+      } catch (batchError) {
+        console.error(`❌ Error in batch ${i + 1}:`, batchError.message);
+
+        // If it's a grid limits error, try to expand the sheet
+        if (batchError.message.includes("exceeds grid limits")) {
+          console.log("Attempting to expand sheet dimensions...");
+
+          try {
+            // Expand the sheet to accommodate the data
+            const newRowCount = Math.max(endRow + 100, requiredRows);
+
+            await oauthSheets.spreadsheets.batchUpdate({
+              spreadsheetId: spreadsheetId,
+              requestBody: {
+                requests: [
+                  {
+                    updateSheetProperties: {
+                      properties: {
+                        sheetId: 0, // Usually the first sheet
+                        gridProperties: {
+                          rowCount: newRowCount,
+                          columnCount: requiredColumns,
+                        },
+                      },
+                      fields:
+                        "gridProperties.rowCount,gridProperties.columnCount",
+                    },
+                  },
+                ],
+              },
+            });
+
+            console.log(`✅ Sheet expanded to ${newRowCount} rows`);
+
+            // Retry the batch after expansion
+            await oauthSheets.spreadsheets.values.update({
+              spreadsheetId: spreadsheetId,
+              range: `${sheetName}!${batchStartCell}`,
+              valueInputOption: "RAW",
+              requestBody: {
+                values: batchValues,
+              },
+            });
+
+            console.log(
+              `✅ Batch ${i + 1} inserted successfully after expansion`
+            );
+          } catch (expansionError) {
+            console.error("Failed to expand sheet:", expansionError.message);
+            throw batchError; // Re-throw original error
+          }
+        } else {
+          throw batchError; // Re-throw if it's not a grid limits error
+        }
+      }
+    }
+
+    // Format headers (make them bold) - only if we have headers
+    if (
+      values.length > 0 &&
+      (headers || (tableData[0] && typeof tableData[0] === "object"))
+    ) {
+      try {
+        await oauthSheets.spreadsheets.batchUpdate({
+          spreadsheetId: spreadsheetId,
+          requestBody: {
+            requests: [
+              {
+                repeatCell: {
+                  range: {
+                    sheetId: 0,
+                    startRowIndex: 0,
+                    endRowIndex: 1,
+                    startColumnIndex: 0,
+                    endColumnIndex: values[0].length,
+                  },
+                  cell: {
+                    userEnteredFormat: {
+                      textFormat: {
+                        bold: true,
+                      },
+                      backgroundColor: {
+                        red: 0.9,
+                        green: 0.9,
+                        blue: 0.9,
+                      },
+                    },
+                  },
+                  fields: "userEnteredFormat(textFormat,backgroundColor)",
+                },
+              },
+            ],
+          },
+        });
+
+        console.log("✅ Headers formatted successfully");
+      } catch (formatError) {
+        console.warn(
+          "Failed to format headers (non-critical):",
+          formatError.message
+        );
+      }
+    }
+
+    const spreadsheetUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+
+    res.status(200).json({
+      message: "Table sheet created successfully",
+      spreadsheetId: spreadsheetId,
+      spreadsheetUrl: spreadsheetUrl,
+      totalRows: values.length,
+      dataRows: tableData.length,
+      sheetDimensions: {
+        rows: requiredRows,
+        columns: requiredColumns,
+      },
+      authMethod: "OAuth2",
+      batchesProcessed: totalBatches,
+      hasHeaders:
+        !!headers || (tableData[0] && typeof tableData[0] === "object"),
+    });
+  } catch (error) {
+    console.error("Error creating table sheet:", error);
+
+    let errorMessage = `Failed to create table sheet: ${error.message}`;
+    if (error.code === 403) {
+      errorMessage =
+        "Permission denied. Please check your OAuth2 credentials and permissions.";
+    } else if (error.code === 401) {
+      errorMessage = "Authentication failed. Please refresh your OAuth2 token.";
+    } else if (error.message.includes("quota")) {
+      errorMessage = "API quota exceeded. Please try again later.";
+    } else if (error.message.includes("grid limits")) {
+      errorMessage =
+        "Sheet size exceeded. The function will attempt to expand the sheet automatically.";
+    }
+
+    next(createError(500, errorMessage));
   }
 };
