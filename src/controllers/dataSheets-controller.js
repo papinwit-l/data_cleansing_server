@@ -1193,7 +1193,114 @@ module.exports.createMultiSlidePresentation = async (req, res, next) => {
   }
 };
 
-// Export data to existing sheet - Modified to use OAuth2
+const checkSheetExists = async (oauthSheets, spreadsheetId, sheetName) => {
+  try {
+    const spreadsheet = await oauthSheets.spreadsheets.get({
+      spreadsheetId: spreadsheetId,
+    });
+
+    const sheetExists = spreadsheet.data.sheets.some(
+      (sheet) => sheet.properties.title === sheetName
+    );
+
+    return sheetExists;
+  } catch (error) {
+    console.error("Error checking sheet existence:", error);
+    return false;
+  }
+};
+
+// Helper function to check if sheet exists and create with proper size
+const ensureSheetExists = async (
+  oauthSheets,
+  spreadsheetId,
+  sheetName,
+  requiredRows = 1000,
+  requiredColumns = 26
+) => {
+  try {
+    const spreadsheet = await oauthSheets.spreadsheets.get({
+      spreadsheetId: spreadsheetId,
+    });
+
+    const existingSheet = spreadsheet.data.sheets.find(
+      (sheet) => sheet.properties.title === sheetName
+    );
+
+    if (!existingSheet) {
+      console.log(
+        `Sheet "${sheetName}" doesn't exist. Creating it with ${requiredRows} rows and ${requiredColumns} columns...`
+      );
+
+      // Create the sheet with proper dimensions from the start
+      await oauthSheets.spreadsheets.batchUpdate({
+        spreadsheetId: spreadsheetId,
+        requestBody: {
+          requests: [
+            {
+              addSheet: {
+                properties: {
+                  title: sheetName,
+                  gridProperties: {
+                    rowCount: Math.max(requiredRows, 1000),
+                    columnCount: Math.max(requiredColumns, 26),
+                  },
+                },
+              },
+            },
+          ],
+        },
+      });
+
+      console.log(`Sheet "${sheetName}" created successfully`);
+      return { created: true, existed: false, sheetId: null };
+    } else {
+      // Sheet exists, check if it needs expansion
+      const currentRows = existingSheet.properties.gridProperties.rowCount;
+      const currentColumns =
+        existingSheet.properties.gridProperties.columnCount;
+      const sheetId = existingSheet.properties.sheetId;
+
+      if (currentRows < requiredRows || currentColumns < requiredColumns) {
+        console.log(
+          `Expanding existing sheet from ${currentRows}x${currentColumns} to ${Math.max(
+            requiredRows,
+            currentRows
+          )}x${Math.max(requiredColumns, currentColumns)}`
+        );
+
+        await oauthSheets.spreadsheets.batchUpdate({
+          spreadsheetId: spreadsheetId,
+          requestBody: {
+            requests: [
+              {
+                updateSheetProperties: {
+                  properties: {
+                    sheetId: sheetId,
+                    gridProperties: {
+                      rowCount: Math.max(requiredRows, currentRows),
+                      columnCount: Math.max(requiredColumns, currentColumns),
+                    },
+                  },
+                  fields: "gridProperties.rowCount,gridProperties.columnCount",
+                },
+              },
+            ],
+          },
+        });
+
+        console.log("Sheet expanded successfully");
+      }
+
+      return { created: false, existed: true, sheetId: sheetId };
+    }
+  } catch (error) {
+    console.error("Error ensuring sheet exists:", error);
+    throw error;
+  }
+};
+
+// Modified exportDataToExistingSheet function
 module.exports.exportDataToExistingSheet = async (req, res, next) => {
   try {
     const {
@@ -1217,22 +1324,13 @@ module.exports.exportDataToExistingSheet = async (req, res, next) => {
     }
 
     console.log(
-      `Exporting ${data.length} rows to existing sheet: ${spreadsheetId} using OAuth2`
+      `Exporting ${data.length} rows to sheet: ${spreadsheetId} using OAuth2`
     );
 
     // Use OAuth2 clients
     const { sheets: oauthSheets } = await getOAuth2Clients();
 
-    // Clear existing data if requested
-    if (clearExisting) {
-      await oauthSheets.spreadsheets.values.clear({
-        spreadsheetId: spreadsheetId,
-        range: `${sheetName}!A:ZZ`,
-      });
-      console.log("Existing data cleared");
-    }
-
-    // Prepare data for insertion
+    // Prepare data for insertion first to calculate required dimensions
     const values = data.map((row) => {
       if (Array.isArray(row)) {
         return row;
@@ -1242,6 +1340,46 @@ module.exports.exportDataToExistingSheet = async (req, res, next) => {
         return [row];
       }
     });
+
+    // Calculate required sheet dimensions
+    const requiredRows = values.length + 100; // Add buffer
+    const requiredColumns = Math.max(values[0]?.length || 1, 26);
+
+    console.log(
+      `Data requires ${values.length} rows, ${
+        values[0]?.length || 0
+      } columns. Creating/expanding sheet to ${requiredRows}x${requiredColumns}`
+    );
+
+    // Ensure the sheet exists with the correct dimensions
+    const sheetStatus = await ensureSheetExists(
+      oauthSheets,
+      spreadsheetId,
+      sheetName,
+      requiredRows,
+      requiredColumns
+    );
+
+    if (sheetStatus.created) {
+      console.log(
+        `Created new sheet "${sheetName}" with ${requiredRows} rows - no need to clear`
+      );
+    } else if (clearExisting) {
+      // Sheet existed and we want to clear it
+      try {
+        await oauthSheets.spreadsheets.values.clear({
+          spreadsheetId: spreadsheetId,
+          range: `${sheetName}!A:ZZ`,
+        });
+        console.log("Existing data cleared");
+      } catch (clearError) {
+        console.error("Error clearing data:", clearError);
+        return res.status(400).json({
+          error: `Failed to clear data from sheet "${sheetName}": ${clearError.message}`,
+          suggestion: "Check if you have edit permissions",
+        });
+      }
+    }
 
     // Insert data in batches for large datasets
     const BATCH_SIZE = 1000;
@@ -1262,14 +1400,28 @@ module.exports.exportDataToExistingSheet = async (req, res, next) => {
         } to ${endRow}`
       );
 
-      await oauthSheets.spreadsheets.values.update({
-        spreadsheetId: spreadsheetId,
-        range: `${sheetName}!${batchStartCell}`,
-        valueInputOption: "RAW",
-        requestBody: {
-          values: batchValues,
-        },
-      });
+      try {
+        await oauthSheets.spreadsheets.values.update({
+          spreadsheetId: spreadsheetId,
+          range: `${sheetName}!${batchStartCell}`,
+          valueInputOption: "RAW",
+          requestBody: {
+            values: batchValues,
+          },
+        });
+
+        console.log(`Batch ${i + 1} inserted successfully`);
+      } catch (insertError) {
+        console.error(`Error inserting batch ${i + 1}:`, insertError);
+        return res.status(400).json({
+          error: `Failed to insert batch ${i + 1} into sheet "${sheetName}": ${
+            insertError.message
+          }`,
+          suggestion: "Check if you have edit permissions",
+          batchesProcessed: i,
+          totalBatches: totalBatches,
+        });
+      }
 
       // Small delay between batches to avoid rate limits
       if (i < totalBatches - 1) {
@@ -1277,19 +1429,25 @@ module.exports.exportDataToExistingSheet = async (req, res, next) => {
       }
     }
 
-    const spreadsheetUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+    const spreadsheetUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit#gid=${
+      sheetStatus.created ? "new" : "existing"
+    }`;
 
     res.status(200).json({
-      message: "Data exported to existing sheet successfully",
+      message: sheetStatus.created
+        ? `Data exported to newly created sheet "${sheetName}" successfully`
+        : `Data exported to existing sheet "${sheetName}" successfully`,
       spreadsheetId: spreadsheetId,
       spreadsheetUrl: spreadsheetUrl,
+      sheetName: sheetName,
+      sheetCreated: sheetStatus.created,
       rowsInserted: values.length,
       columnsInserted: values[0]?.length || 0,
       authMethod: "OAuth2",
       batchesProcessed: totalBatches,
     });
   } catch (error) {
-    console.error("Error exporting data to existing sheet:", error);
+    console.error("Error exporting data to sheet:", error);
 
     let errorMessage = `Failed to export data: ${error.message}`;
     if (error.code === 403) {
